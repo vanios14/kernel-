@@ -1,9 +1,25 @@
-# kernel-
-proyecto de kernel sistema operativos 
+# Estados po
+# sibles de un proceso en el simulador
+NUEVO = "NUEVO"
+LISTO = "LISTO"
+EJECUTANDO = "EJECUTANDO"
+BLOQUEADO = "BLOQUEADO"
+TERMINADO = "TERMINADO"
+ABORTADO = "ABORTADO"
+RECHAZADO = "RECHAZADO"
+
+
 class PCB:
     def __init__(self, pid, tam_mb, rafaga):
-        self.pid = pid
-        self.estado = "NUEVO"   # NUEVO, LISTO, EJECUTANDO, BLOQUEADO, TERMINADO
-        self.tam_mb = tam_mb
-        self.rafaga_total = rafaga
-        self.rafaga_restante = rafaga
+        self.pid = pid                  # Identificador único
+        self.estado = NUEVO             # Estado actual
+        self.tam_mb = tam_mb            # Tamaño en memoria (MB)
+        self.rafaga_total = rafaga      # Ráfaga de CPU total (unidades de tiempo)
+        self.rafaga_restante = rafaga   # Ráfaga de CPU que falta por ejecutar
+        # Datos extra para calcular métricas (tiempos de espera/retorno)
+        self.llegada = 0
+        self.fin = None
+
+    def __repr__(self):
+        return (f"PCB(pid={self.pid}, estado={self.estado}, mem={self.tam_mb}MB, "
+                f"total={self.rafaga_total}, restante={self.rafaga_restante})")
