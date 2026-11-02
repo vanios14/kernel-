@@ -1,0 +1,623 @@
+# Estados po
+# sibles de un proceso en el simulador
+NUEVO = "NUEVO"
+LISTO = "LISTO"
+EJECUTANDO = "EJECUTANDO"
+BLOQUEADO = "BLOQUEADO"
+TERMINADO = "TERMINADO"
+ABORTADO = "ABORTADO"
+RECHAZADO = "RECHAZADO"
+
+
+class PCB:
+    def __init__(self, pid, tam_mb, rafaga):
+        self.pid = pid                  # identificador único
+        self.estado = NUEVO             # estado actual
+        self.tam_mb = tam_mb            # tamaño en memoriaa (MB)
+        self.rafaga_total = rafaga      # rafaga de CPU total (unidades de tiempo)
+        self.rafaga_restante = rafaga   # rafaga de CPU que falta por ejecutar
+        # Datos extra para calcular métricas (tiempos de espera/retorno)
+        self.llegada = 0
+        self.fin = None
+
+    def __repr__(self):
+        return (f"PCB(pid={self.pid}, estado={self.estado}, mem={self.tam_mb}MB, "
+                f"total={self.rafaga_total}, restante={self.rafaga_restante})")
+
+
+# ============================================================
+# MÓDULO: memoria.py
+# ============================================================
+"""memoria.py - Administrador de Memoria (RAM de 100 MB).
+
+Estrategia: Asignación CONTIGUA DINÁMICA con First-Fit.
+La RAM es una lista de bloques (inicio, tamaño, dueño). Al crear un
+proceso se busca el primer hueco libre suficientemente grande y se
+parte. Al terminar, el bloque se libera y se fusiona con huecos vecinos.
+Si no hay espacio se lanza OutOfMemoryError y el proceso es rechazado.
+"""
+
+
+class OutOfMemoryError(Exception):
+    """Error de desbordamiento de memoria (Out of Memory)."""
+
+
+class Memoria:
+    TOTAL_MB = 100
+
+    def __init__(self):
+        # un solo bloque libre que abarca toda la RAM
+        self.bloques = [{"inicio": 0, "tam": self.TOTAL_MB, "pid": None}]
+
+    def libre_total(self):
+        return sum(b["tam"] for b in self.bloques if b["pid"] is None)
+
+    def usada(self):
+        return self.TOTAL_MB - self.libre_total()
+
+    def asignar(self, pid, tam_mb):
+        """Reserva tam_mb MB para el proceso pid (First-Fit)."""
+        if tam_mb <= 0:
+            raise ValueError("El tamaño debe ser mayor que 0 MB.")
+        for i, b in enumerate(self.bloques):
+            if b["pid"] is None and b["tam"] >= tam_mb:
+                resto = b["tam"] - tam_mb
+                b["tam"], b["pid"] = tam_mb, pid
+                if resto > 0:  # el sobrante queda como un nuevo hueco libre
+                    self.bloques.insert(i + 1, {"inicio": b["inicio"] + tam_mb,
+                                                "tam": resto, "pid": None})
+                return b["inicio"]
+        # Si llegamos aquí no hubo hueco: distinguimos la causa para el reporte
+        if tam_mb > self.libre_total():
+            causa = f"memoria insuficiente (libres {self.libre_total()} MB)"
+        else:
+            causa = (f"fragmentación externa (libres {self.libre_total()} MB "
+                     f"pero no contiguos)")
+        raise OutOfMemoryError(f"Out of Memory: P{pid} solicita {tam_mb} MB -> {causa}")
+
+    def liberar(self, pid):
+        """Libera la memoria del proceso y fusiona huecos adyacentes."""
+        for b in self.bloques:
+            if b["pid"] == pid:
+                b["pid"] = None
+        # Coalescencia: unir huecos libres consecutivos
+        i = 0
+        while i < len(self.bloques) - 1:
+            a, b = self.bloques[i], self.bloques[i + 1]
+            if a["pid"] is None and b["pid"] is None:
+                a["tam"] += b["tam"]
+                del self.bloques[i + 1]
+            else:
+                i += 1
+
+    def mostrar(self):
+        """Imprime el mapa de memoria con una barra visual."""
+        print(f"\n--- Mapa de RAM ({self.usada()}/{self.TOTAL_MB} MB usados) ---")
+        for b in self.bloques:
+            dueno = f"P{b['pid']}" if b["pid"] is not None else "LIBRE"
+            print(f"  [{b['inicio']:>3} - {b['inicio'] + b['tam'] - 1:>3}] "
+                  f"{b['tam']:>3} MB  {dueno}")
+        barra = ""
+        for b in self.bloques:
+            simbolo = "." if b["pid"] is None else str(b["pid"] % 10)
+            barra += simbolo * max(1, round(b["tam"] / 2))
+        print(f"  |{barra}|  (cada caracter ~2 MB, '.' = libre)")
+
+
+# ============================================================
+# MÓDULO: planificador.py
+# ============================================================
+"""planificador.py - Planificador de procesos Round Robin (quantum = 3)."""
+from collections import deque
+
+
+QUANTUM = 3  # Quantum fijo exigido por el enunciado
+
+
+class Planificador:
+    def __init__(self, memoria):
+        self.memoria = memoria
+        self.procesos = {}          # pid -> PCB (todos, incluso terminados)
+        self.cola = deque()         # cola de listos (FIFO)
+        self.reloj = 0              # reloj global simulado
+        self._sig_pid = 1
+        self.al_terminar = None     # callback opcional (liberar recursos)
+
+    # ------------------------------------------------------------------
+    def crear_proceso(self, tam_mb, rafaga):
+        """Crea un PCB y valida la RAM. Si no cabe, lo rechaza (OOM)."""
+        pid = self._sig_pid
+        self._sig_pid += 1
+        pcb = PCB(pid, tam_mb, rafaga)
+        pcb.llegada = self.reloj
+        self.procesos[pid] = pcb
+        try:
+            inicio = self.memoria.asignar(pid, tam_mb)
+        except OutOfMemoryError:
+            pcb.estado = RECHAZADO
+            raise
+        pcb.estado = LISTO
+        self.cola.append(pcb)
+        print(f"  [OK] P{pid} creado: {tam_mb} MB (dir {inicio}), ráfaga {rafaga}")
+        return pcb
+
+    # ------------------------------------------------------------------
+    def ejecutar(self):
+        """Ejecuta Round Robin hasta vaciar la cola de listos."""
+        if not self.cola:
+            print("  La cola de listos está vacía. Crea procesos primero.")
+            return
+        print(f"\n=== Round Robin (quantum = {QUANTUM}) ===")
+        gantt = []
+        terminados = []
+        while self.cola:
+            p = self.cola.popleft()
+            p.estado = EJECUTANDO
+            tiempo = min(QUANTUM, p.rafaga_restante)
+            inicio = self.reloj
+            p.rafaga_restante -= tiempo
+            self.reloj += tiempo
+            gantt.append((p.pid, inicio, self.reloj))
+            print(f"  [t={inicio:>3}->{self.reloj:>3}] P{p.pid} ejecuta {tiempo} u. "
+                  f"| restante: {p.rafaga_restante}")
+            if p.rafaga_restante == 0:
+                p.fin = self.reloj
+                print(f"      P{p.pid} TERMINÓ; se libera su memoria.")
+                self._finalizar(p, TERMINADO)
+                terminados.append(p)
+            else:
+                # Quantum agotado: cambio de contexto simulado
+                p.estado = LISTO
+                self.cola.append(p)
+                print(f"      Quantum agotado -> CAMBIO DE CONTEXTO: "
+                      f"P{p.pid} vuelve al final de la cola")
+        self._mostrar_gantt(gantt)
+        self._mostrar_metricas(terminados)
+        bloqueados = [p.pid for p in self.procesos.values() if p.estado == BLOQUEADO]
+        if bloqueados:
+            print(f"  Aviso: siguen BLOQUEADOS (no planificables): "
+                  f"{', '.join('P' + str(b) for b in bloqueados)}")
+
+    # ------------------------------------------------------------------
+    def _finalizar(self, pcb, estado):
+        """Libera memoria, marca estado final y avisa al gestor de recursos."""
+        self.memoria.liberar(pcb.pid)
+        pcb.estado = estado
+        if self.al_terminar:
+            self.al_terminar(pcb.pid)
+
+    def bloquear(self, pid):
+        """Saca un proceso de la cola de listos y lo marca BLOQUEADO."""
+        pcb = self.procesos[pid]
+        if pcb in self.cola:
+            self.cola.remove(pcb)
+        pcb.estado = BLOQUEADO
+
+    def reinsertar(self, pid):
+        """Devuelve un proceso desbloqueado a la cola de listos."""
+        pcb = self.procesos[pid]
+        pcb.estado = LISTO
+        self.cola.append(pcb)
+
+    def abortar(self, pid):
+        """Mata un proceso: lo saca de la cola, libera RAM y recursos."""
+        pcb = self.procesos[pid]
+        if pcb in self.cola:
+            self.cola.remove(pcb)
+        self._finalizar(pcb, ABORTADO)
+
+    def activos(self):
+        """PIDs de procesos vivos (listos, ejecutando o bloqueados)."""
+        return [p.pid for p in self.procesos.values()
+                if p.estado in (LISTO, EJECUTANDO, BLOQUEADO)]
+
+    # ------------------------------------------------------------------
+    def mostrar_procesos(self):
+        print("\n--- Tabla de procesos (PCB) ---")
+        if not self.procesos:
+            print("  (sin procesos)")
+            return
+        print(f"  {'PID':>4} {'ESTADO':<11} {'MEM(MB)':>8} {'TOTAL':>6} {'RESTANTE':>9}")
+        for p in self.procesos.values():
+            print(f"  {p.pid:>4} {p.estado:<11} {p.tam_mb:>8} "
+                  f"{p.rafaga_total:>6} {p.rafaga_restante:>9}")
+        cola = " -> ".join(f"P{p.pid}" for p in self.cola) or "(vacía)"
+        print(f"  Cola de listos: {cola}")
+
+    @staticmethod
+    def _mostrar_gantt(gantt):
+        print("\n  Diagrama de Gantt:")
+        linea1 = "  |"
+        linea2 = "  0"
+        for pid, ini, fin in gantt:
+            ancho = max(4, (fin - ini) * 2)
+            linea1 += f"P{pid}".center(ancho) + "|"
+            linea2 += str(fin).rjust(ancho + 1)
+        print(linea1)
+        print(linea2)
+
+    @staticmethod
+    def _mostrar_metricas(terminados):
+        """Tiempo de retorno = fin - llegada; espera = retorno - ráfaga total."""
+        if not terminados:
+            return
+        print("\n  Métricas (tiempo de espera = fin - llegada - ráfaga total):")
+        print(f"  {'PID':>4} {'LLEGADA':>8} {'RÁFAGA':>7} {'FIN':>5} {'ESPERA':>7} {'RETORNO':>8}")
+        esperas, retornos = [], []
+        for p in terminados:
+            retorno = p.fin - p.llegada
+            espera = retorno - p.rafaga_total
+            esperas.append(espera)
+            retornos.append(retorno)
+            print(f"  {p.pid:>4} {p.llegada:>8} {p.rafaga_total:>7} {p.fin:>5} "
+                  f"{espera:>7} {retorno:>8}")
+        print(f"  Espera promedio: {sum(esperas) / len(esperas):.2f} | "
+              f"Retorno promedio: {sum(retornos) / len(retornos):.2f}")
+
+
+# ============================================================
+# MÓDULO: semaforo.py
+# ============================================================
+"""semaforo.py - Semáforo binario y demostración de condición de carrera.
+
+Se simula concurrencia con generadores: cada "proceso" cede el control
+(yield) entre pasos de leer / calcular / escribir, así el planificador
+intercala instrucciones y se reproduce la condición de carrera de forma
+determinista (ideal para la bitácora de pruebas).
+"""
+from collections import deque
+
+
+
+class SemaforoBinario:
+    def __init__(self):
+        self.valor = 1            # 1 = libre, 0 = ocupado
+        self.espera = deque()     # cola de espera específica
+
+    def wait(self, pcb):
+        """Intenta entrar. True si entra; False si queda bloqueado en cola."""
+        if self.valor == 1:
+            self.valor = 0
+            return True
+        pcb.estado = BLOQUEADO
+        self.espera.append(pcb)
+        return False
+
+    def signal(self):
+        """Sale de la sección crítica. Si hay esperando, le cede el acceso."""
+        if self.espera:
+            siguiente = self.espera.popleft()
+            siguiente.estado = LISTO      # el semáforo sigue en 0: pasa directo
+            return siguiente
+        self.valor = 1
+        return None
+
+
+class VariableCompartida:
+    """Región crítica: la variable global compartida."""
+    def __init__(self):
+        self.valor = 0
+
+
+def _tarea(pcb, comp, sem):
+    """Cada tarea hace: valor = valor + 1 (en 3 pasos no atómicos)."""
+    if sem is not None:
+        if not sem.wait(pcb):
+            print(f"  {pcb.pid}: wait() -> sección crítica OCUPADA, "
+                  f"pasa a la cola de espera")
+            while pcb.estado == BLOQUEADO:   # espera hasta que le hagan signal()
+                yield
+        print(f"  {pcb.pid}: wait() -> ENTRA a la sección crítica")
+    pcb.estado = EJECUTANDO
+    local = comp.valor
+    print(f"  {pcb.pid}: LEE valor = {local}")
+    yield
+    local += 1
+    print(f"  {pcb.pid}: CALCULA {local}")
+    yield
+    comp.valor = local
+    print(f"  {pcb.pid}: ESCRIBE valor = {local}")
+    yield
+    if sem is not None:
+        despertado = sem.signal()
+        extra = f" (despierta a {despertado.pid})" if despertado else ""
+        print(f"  {pcb.pid}: signal() -> sale de la sección crítica{extra}")
+    pcb.estado = TERMINADO
+
+
+def demo_condicion_carrera(usar_semaforo, n_procesos=3):
+    """Ejecuta n procesos que incrementan la variable compartida en 1."""
+    titulo = "CON semáforo" if usar_semaforo else "SIN semáforo"
+    print(f"\n=== Condición de carrera {titulo} ({n_procesos} procesos) ===")
+    comp = VariableCompartida()
+    sem = SemaforoBinario() if usar_semaforo else None
+    pcbs = [PCB(f"H{i + 1}", 0, 0) for i in range(n_procesos)]
+    tareas = [_tarea(p, comp, sem) for p in pcbs]
+    while tareas:                      # planificación intercalada (1 paso c/u)
+        for t in list(tareas):
+            try:
+                next(t)
+            except StopIteration:
+                tareas.remove(t)
+    esperado = n_procesos
+    print(f"\n  Valor final = {comp.valor} | Valor esperado = {esperado}")
+    if comp.valor == esperado:
+        print("  RESULTADO: CORRECTO. La exclusión mutua evitó la condición de carrera.")
+    else:
+        print(f"  RESULTADO: INCORRECTO. Se perdieron {esperado - comp.valor} "
+              f"actualizaciones (condición de carrera).")
+
+
+# ============================================================
+# MÓDULO: deadlock.py
+# ============================================================
+"""deadlock.py - Recursos exclusivos, interbloqueo, detección y resolución."""
+
+
+class GestorRecursos:
+    """Dos recursos exclusivos (1 y 2).
+    dueno[r]  -> pid que retiene el recurso r (o None)
+    espera[p] -> recurso que el proceso p está solicitando y no obtuvo
+    """
+
+    def __init__(self):
+        self.dueno = {1: None, 2: None}
+        self.espera = {}
+
+    def solicitar(self, pid, recurso):
+        """True si se concede; False si el proceso queda esperando."""
+        if self.dueno[recurso] is None:
+            self.dueno[recurso] = pid
+            return True
+        if self.dueno[recurso] == pid:
+            return True
+        self.espera[pid] = recurso
+        return False
+
+    def hay_recursos_en_uso(self):
+        return any(v is not None for v in self.dueno.values()) or bool(self.espera)
+
+    def forzar_deadlock(self, pid_a, pid_b):
+        """Crea la espera circular exigida:
+        A retiene R1 y pide R2; B retiene R2 y pide R1."""
+        print(f"  P{pid_a} solicita Recurso 1 -> "
+              f"{'CONCEDIDO' if self.solicitar(pid_a, 1) else 'espera'}")
+        print(f"  P{pid_b} solicita Recurso 2 -> "
+              f"{'CONCEDIDO' if self.solicitar(pid_b, 2) else 'espera'}")
+        print(f"  P{pid_a} solicita Recurso 2 -> "
+              f"{'CONCEDIDO' if self.solicitar(pid_a, 2) else 'DENEGADO (lo tiene P' + str(pid_b) + '), se bloquea'}")
+        print(f"  P{pid_b} solicita Recurso 1 -> "
+              f"{'CONCEDIDO' if self.solicitar(pid_b, 1) else 'DENEGADO (lo tiene P' + str(pid_a) + '), se bloquea'}")
+
+    def detectar(self):
+        """Busca un ciclo en el grafo de espera. Devuelve la lista de PIDs
+        involucrados o None si no hay deadlock."""
+        for inicio in self.espera:
+            visitados = [inicio]
+            actual = inicio
+            while actual in self.espera:
+                retenedor = self.dueno[self.espera[actual]]
+                if retenedor is None:
+                    break
+                if retenedor == inicio:
+                    return visitados            # ciclo cerrado: DEADLOCK
+                if retenedor in visitados:
+                    break
+                visitados.append(retenedor)
+                actual = retenedor
+        return None
+
+    def liberar_proceso(self, pid):
+        """Libera todo lo que tiene pid y cede los recursos a quien espera.
+        Devuelve la lista de PIDs que quedaron desbloqueados."""
+        self.espera.pop(pid, None)
+        desbloqueados = []
+        for r in (1, 2):
+            if self.dueno[r] == pid:
+                self.dueno[r] = None
+                for esperando, rec in list(self.espera.items()):
+                    if rec == r:
+                        self.dueno[r] = esperando
+                        del self.espera[esperando]
+                        desbloqueados.append(esperando)
+                        break
+        return desbloqueados
+
+    def mostrar(self):
+        print("\n--- Estado de recursos ---")
+        for r in (1, 2):
+            d = self.dueno[r]
+            print(f"  Recurso {r}: {'libre' if d is None else 'retenido por P' + str(d)}")
+        for p, r in self.espera.items():
+            print(f"  P{p} espera el Recurso {r}")
+
+
+# ============================================================
+# MÓDULO: main.py
+# ============================================================
+"""main.py - Simulador de Funciones del Kernel (CLI).
+
+Sistemas Operativos I - Universidad Mariano Gálvez de Guatemala.
+Une los 5 componentes: procesos/Round Robin, memoria, semáforo,
+deadlock y el menú interactivo con validación de entradas.
+"""
+import random
+
+
+MAX_RAFAGA = 1000
+
+
+def leer_entero(mensaje, minimo, maximo):
+    """Lee un entero validado. Repite hasta que sea válido (robustez)."""
+    while True:
+        texto = input(mensaje).strip()
+        try:
+            valor = int(texto)
+        except ValueError:
+            print(f"  Entrada inválida: '{texto}' no es un número entero.")
+            continue
+        if valor < minimo or valor > maximo:
+            print(f"  Fuera de rango: debe estar entre {minimo} y {maximo}.")
+            continue
+        return valor
+
+
+def menu():
+    print("\n" + "=" * 52)
+    print("   SIMULADOR DEL KERNEL - SISTEMAS OPERATIVOS I")
+    print("=" * 52)
+    print(" 1. Crear proceso")
+    print(" 2. Crear procesos aleatorios (prueba de estrés)")
+    print(" 3. Ver tabla de procesos y cola de listos")
+    print(" 4. Ver mapa de memoria RAM")
+    print(f" 5. Ejecutar Round Robin (q = {QUANTUM})")
+    print(" 6. Condición de carrera SIN semáforo")
+    print(" 7. Condición de carrera CON semáforo")
+    print(" 8. Forzar DEADLOCK")
+    print(" 9. Detectar deadlock / ver recursos")
+    print("10. Abortar un proceso (resolver deadlock)")
+    print(" 0. Salir")
+
+
+def main():
+    memoria = Memoria()
+    plan = Planificador(memoria)
+    recursos = GestorRecursos()
+
+    def liberar_recursos(pid):
+        """Cuando un proceso termina o es abortado, libera sus recursos
+        y reinserta en la cola de listos a quien estaba bloqueado por ellos."""
+        for desbloqueado in recursos.liberar_proceso(pid):
+            print(f"  P{desbloqueado} obtuvo el recurso que esperaba -> "
+                  f"pasa a LISTO")
+            plan.reinsertar(desbloqueado)
+
+    plan.al_terminar = liberar_recursos
+
+    while True:
+        menu()
+        try:
+            opcion = input("Opción: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nSaliendo...")
+            break
+
+        try:
+            if opcion == "1":
+                tam = leer_entero(f"  Tamaño en memoria (1-{memoria.TOTAL_MB} MB): ",
+                                  1, 10 ** 6)  # permite probar el rechazo OOM
+                rafaga = leer_entero(f"  Ráfaga de CPU (1-{MAX_RAFAGA}): ", 1, MAX_RAFAGA)
+                try:
+                    plan.crear_proceso(tam, rafaga)
+                except OutOfMemoryError as e:
+                    print(f"  [ERROR] {e}  -> proceso RECHAZADO")
+
+            elif opcion == "2":
+                n = leer_entero("  ¿Cuántos procesos aleatorios? (1-50): ", 1, 50)
+                for _ in range(n):
+                    tam = random.randint(5, 40)
+                    rafaga = random.randint(1, 15)
+                    try:
+                        plan.crear_proceso(tam, rafaga)
+                    except OutOfMemoryError as e:
+                        print(f"  [ERROR] {e}  -> proceso RECHAZADO")
+
+            elif opcion == "3":
+                plan.mostrar_procesos()
+
+            elif opcion == "4":
+                memoria.mostrar()
+
+            elif opcion == "5":
+                plan.ejecutar()
+
+            elif opcion == "6":
+                demo_condicion_carrera(usar_semaforo=False)
+
+            elif opcion == "7":
+                demo_condicion_carrera(usar_semaforo=True)
+
+            elif opcion == "8":
+                forzar_deadlock(plan, recursos)
+
+            elif opcion == "9":
+                recursos.mostrar()
+                ciclo = recursos.detectar()
+                if ciclo:
+                    cadena = " -> ".join(f"P{p}" for p in ciclo) + f" -> P{ciclo[0]}"
+                    print(f"\n  *** ¡ALERTA! DEADLOCK DETECTADO: {cadena} ***")
+                    print("  Use la opción 10 para abortar uno de los procesos.")
+                else:
+                    print("\n  No hay deadlock.")
+
+            elif opcion == "10":
+                abortar(plan, recursos)
+
+            elif opcion == "0":
+                print("Fin de la simulación.")
+                break
+            else:
+                print(f"  Opción '{opcion}' no válida. Elige un número del menú.")
+        except (EOFError, KeyboardInterrupt):
+            print("\nSaliendo...")
+            break
+
+
+def pedir_pid_activo(plan, mensaje, excluir=None):
+    """Pide un PID y valida que exista y siga vivo."""
+    activos = plan.activos()
+    pid = leer_entero(mensaje, 1, 10 ** 9)
+    if pid not in plan.procesos:
+        print(f"  El proceso P{pid} no existe.")
+        return None
+    if pid not in activos:
+        print(f"  P{pid} ya no está activo (estado {plan.procesos[pid].estado}).")
+        return None
+    if pid == excluir:
+        print("  Debe ser un proceso distinto al anterior.")
+        return None
+    return pid
+
+
+def forzar_deadlock(plan, recursos):
+    if recursos.hay_recursos_en_uso():
+        print("  Ya hay recursos en uso/espera. Resuelve el deadlock actual primero.")
+        return
+    if len(plan.activos()) < 2:
+        print("  Se necesitan al menos 2 procesos activos. Crea más con la opción 1 o 2.")
+        return
+    plan.mostrar_procesos()
+    a = pedir_pid_activo(plan, "  PID del Proceso A: ")
+    if a is None:
+        return
+    b = pedir_pid_activo(plan, "  PID del Proceso B: ", excluir=a)
+    if b is None:
+        return
+    print("\n=== Forzando espera circular ===")
+    recursos.forzar_deadlock(a, b)
+    plan.bloquear(a)
+    plan.bloquear(b)
+    print("\n  P{} y P{} quedaron BLOQUEADOS.".format(a, b))
+    print("  Use la opción 9 para detectar el deadlock.")
+
+
+def abortar(plan, recursos):
+    activos = plan.activos()
+    if not activos:
+        print("  No hay procesos activos para abortar.")
+        return
+    ciclo = recursos.detectar()
+    if ciclo:
+        print("  Procesos en deadlock: " + ", ".join(f"P{p}" for p in ciclo))
+    pid = pedir_pid_activo(plan, "  PID del proceso a abortar: ")
+    if pid is None:
+        return
+    print(f"\n  Abortando P{pid}: se libera su memoria y sus recursos...")
+    plan.abortar(pid)
+    if ciclo and pid in ciclo and recursos.detectar() is None:
+        print("  Deadlock RESUELTO: el ciclo de espera se rompió.")
+    print("  Ejecuta Round Robin (opción 5) para que el proceso restante termine.")
+
+
+if __name__ == "__main__":
+    main()
